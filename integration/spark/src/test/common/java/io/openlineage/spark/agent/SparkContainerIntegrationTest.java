@@ -244,10 +244,9 @@ public class SparkContainerIntegrationTest {
     String startCTASEvent = new String(readAllBytes(eventFolder.resolve("pysparkCTASStart.json")));
     String completeCTASEvent = new String(readAllBytes(eventFolder.resolve("pysparkCTASEnd.json")));
 
-    //    String startLoadEvent =
-    //      new String(readAllBytes(eventFolder.resolve("pysparkLoadStart.json")));
-    //    String completeLoadEvent =
-    //      new String(readAllBytes(eventFolder.resolve("pysparkLoadComplete.json")));
+    String startLoadEvent = new String(readAllBytes(eventFolder.resolve("pysparkLoadStart.json")));
+    String completeLoadEvent =
+        new String(readAllBytes(eventFolder.resolve("pysparkLoadComplete.json")));
 
     mockServerClient.verify(
         request()
@@ -256,12 +255,11 @@ public class SparkContainerIntegrationTest {
         request()
             .withPath("/api/v1/lineage")
             .withBody(json(completeCTASEvent, MatchType.ONLY_MATCHING_FIELDS)));
-    //      TODO: Those do not fire since LoadDataCommand do not fire SparkListenerJobEnd event
-    //      request()
-    //        .withPath("/api/v1/lineage")
-    //        .withBody(json(startLoadEvent, MatchType.ONLY_MATCHING_FIELDS)),
-    //      request()
-    //        .withPath("/api/v1/lineage")
-    //        .withBody(json(completeLoadEvent, MatchType.ONLY_MATCHING_FIELDS)));
+    request()
+        .withPath("/api/v1/lineage")
+        .withBody(json(startLoadEvent, MatchType.ONLY_MATCHING_FIELDS));
+    request()
+        .withPath("/api/v1/lineage")
+        .withBody(json(completeLoadEvent, MatchType.ONLY_MATCHING_FIELDS));
   }
 }

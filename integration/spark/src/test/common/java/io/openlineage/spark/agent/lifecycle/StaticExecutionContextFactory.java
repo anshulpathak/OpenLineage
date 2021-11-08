@@ -89,7 +89,7 @@ public class StaticExecutionContextFactory extends ContextFactory {
 
               SparkSQLExecutionContext sparksql =
                   new SparkSQLExecutionContext(
-                      executionId, sparkContext, outputDatasets, inputDatasets) {
+                      executionId, sparkContext, qe, outputDatasets, inputDatasets) {
                     @Override
                     public ZonedDateTime toZonedTime(long time) {
                       return getZonedTime();
@@ -120,7 +120,11 @@ public class StaticExecutionContextFactory extends ContextFactory {
         .orElseGet(
             () ->
                 new SparkSQLExecutionContext(
-                    executionId, sparkContext, Collections.emptyList(), Collections.emptyList()));
+                    executionId,
+                    sparkContext,
+                    null,
+                    Collections.emptyList(),
+                    Collections.emptyList()));
   }
 
   private static List<PartialFunction<LogicalPlan, List<OpenLineage.Dataset>>>

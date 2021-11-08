@@ -24,6 +24,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.spark.SparkContext;
@@ -35,7 +36,6 @@ import org.apache.spark.scheduler.SparkListenerJobStart;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan;
 import org.apache.spark.sql.execution.QueryExecution;
-import org.apache.spark.sql.execution.SQLExecution;
 import org.apache.spark.sql.execution.SparkPlan;
 import org.apache.spark.sql.execution.WholeStageCodegenExec;
 import org.apache.spark.sql.execution.ui.SparkListenerSQLExecutionEnd;
@@ -57,30 +57,69 @@ public class SparkSQLExecutionContext implements ExecutionContext {
       outputDatasetSupplier;
   private final List<QueryPlanVisitor<LogicalPlan, OpenLineage.InputDataset>> inputDatasetSupplier;
 
+  private AtomicBoolean started = new AtomicBoolean(false);
+  private AtomicBoolean finished = new AtomicBoolean(false);
+
   public SparkSQLExecutionContext(
       long executionId,
       OpenLineageContext sparkContext,
+      QueryExecution queryExecution,
       List<QueryPlanVisitor<LogicalPlan, OpenLineage.OutputDataset>> outputDatasetSupplier,
       List<QueryPlanVisitor<LogicalPlan, OpenLineage.InputDataset>> inputDatasetSupplier) {
     this.executionId = executionId;
     this.sparkContext = sparkContext;
-    this.queryExecution = SQLExecution.getQueryExecution(executionId);
+    this.queryExecution = queryExecution;
     this.outputDatasetSupplier = outputDatasetSupplier;
     this.inputDatasetSupplier = inputDatasetSupplier;
   }
 
-  public void start(SparkListenerSQLExecutionStart startEvent) {}
+  public void start(SparkListenerSQLExecutionStart startEvent) {
+    log.warn("SparkListenerSQLExecutionStart - executionId: " + startEvent.executionId());
+    startEvent(startEvent.time());
+  }
 
-  public void end(SparkListenerSQLExecutionEnd endEvent) {}
+  public void end(SparkListenerSQLExecutionEnd endEvent) {
+    log.warn("SparkListenerSQLExecutionEnd - executionId: " + endEvent.executionId());
+    // TODO: can we get failed event here?
+    // If not, then we probably need to use this only for LogicalPlans that emit no Job events.
+    endEvent(endEvent.time(), "COMPLETE", null);
+  }
 
   @Override
   public void setActiveJob(ActiveJob activeJob) {}
 
   @Override
   public void start(SparkListenerJobStart jobStart) {
-    log.info("Starting job as part of spark-sql:" + jobStart.jobId());
+    log.debug("SparkListenerJobStart - executionId: " + executionId);
+    startEvent(jobStart.time());
+  }
+
+  @Override
+  public void end(SparkListenerJobEnd jobEnd) {
+    log.debug("SparkListenerJobEnd - executionId: " + executionId);
+    Exception exception = null;
+    if (jobEnd.jobResult() instanceof JobFailed) {
+      exception = ((JobFailed) jobEnd.jobResult()).exception();
+    }
+    endEvent(jobEnd.time(), getEventType(jobEnd.jobResult()), exception);
+  }
+
+  public void startEvent(Long time) {
+    if (!started.compareAndSet(false, true)) {
+      log.debug("Start event already emitted: returning");
+      return;
+    }
+
     if (queryExecution == null) {
       log.info("No execution info {}", queryExecution);
+      return;
+    }
+
+    if (LogicalPlanBlacklist.isBlacklistedOutput(queryExecution.optimizedPlan())) {
+      log.debug(
+          String.format(
+              "Node %s is blacklisted as output",
+              queryExecution.optimizedPlan().getClass().getCanonicalName()));
       return;
     }
 
@@ -101,7 +140,7 @@ public class SparkSQLExecutionContext implements ExecutionContext {
     OpenLineage ol = new OpenLineage(OpenLineageClient.OPEN_LINEAGE_CLIENT_URI);
     OpenLineage.RunEvent event =
         ol.newRunEventBuilder()
-            .eventTime(toZonedTime(jobStart.time()))
+            .eventTime(toZonedTime(time))
             .eventType("START")
             .inputs(inputDatasets)
             .outputs(outputDatasets)
@@ -118,7 +157,7 @@ public class SparkSQLExecutionContext implements ExecutionContext {
             .job(buildJob(queryExecution))
             .build();
 
-    log.debug("Posting event for start {}: {}", jobStart, event);
+    log.debug("Posting event for start: {}", event);
     sparkContext.emit(event);
   }
 
@@ -150,17 +189,30 @@ public class SparkSQLExecutionContext implements ExecutionContext {
                     runId, sparkContext.getParentJobName(), sparkContext.getJobNamespace()));
   }
 
-  @Override
-  public void end(SparkListenerJobEnd jobEnd) {
-    log.info("Ending job as part of spark-sql:" + jobEnd.jobId());
+  private void endEvent(Long time, String eventType, Exception exception) {
+    if (!finished.compareAndSet(false, true)) {
+      log.debug("Event already finished, returning");
+      return;
+    }
+
     if (queryExecution == null) {
       log.info("No execution info {}", queryExecution);
       return;
     }
+
+    if (LogicalPlanBlacklist.isBlacklistedOutput(queryExecution.optimizedPlan())) {
+      log.debug(
+          String.format(
+              "Node %s is blacklisted",
+              queryExecution.optimizedPlan().getClass().getCanonicalName()));
+      return;
+    }
+
     if (log.isDebugEnabled()) {
       log.debug("Traversing optimized plan {}", queryExecution.optimizedPlan().toJSON());
       log.debug("Physical plan executed {}", queryExecution.executedPlan().toJSON());
     }
+
     PartialFunction<LogicalPlan, List<OpenLineage.OutputDataset>> outputVisitor =
         merge(outputDatasetSupplier);
     PartialFunction<LogicalPlan, List<OpenLineage.OutputDataset>> planTraversal =
@@ -177,8 +229,8 @@ public class SparkSQLExecutionContext implements ExecutionContext {
     OpenLineage ol = new OpenLineage(OpenLineageClient.OPEN_LINEAGE_CLIENT_URI);
     OpenLineage.RunEvent event =
         ol.newRunEventBuilder()
-            .eventTime(toZonedTime(jobEnd.time()))
-            .eventType(getEventType(jobEnd.jobResult()))
+            .eventTime(toZonedTime(time))
+            .eventType(eventType)
             .inputs(inputDatasets)
             .outputs(outputDatasets)
             .run(
@@ -188,14 +240,14 @@ public class SparkSQLExecutionContext implements ExecutionContext {
                         new SimpleImmutableEntry(
                             "spark.logicalPlan", buildLogicalPlanFacet(queryExecution.logical())),
                         new SimpleImmutableEntry(
-                            "spark.exception", buildJobErrorFacet(jobEnd.jobResult())),
+                            "spark.exception", buildJobErrorFacet(eventType, exception)),
                         new SimpleImmutableEntry("spark_unknown", unknownFacet),
                         new SimpleImmutableEntry(
                             "spark_version", new SparkVersionFacet(SparkSession.active())))))
             .job(buildJob(queryExecution))
             .build();
 
-    log.debug("Posting event for start {}: {}", jobEnd, event);
+    log.debug("Posting event for end: {}", event);
     sparkContext.emit(event);
   }
 
@@ -230,9 +282,9 @@ public class SparkSQLExecutionContext implements ExecutionContext {
     return LogicalPlanFacet.builder().plan(plan).build();
   }
 
-  protected ErrorFacet buildJobErrorFacet(JobResult jobResult) {
-    if (jobResult instanceof JobFailed && ((JobFailed) jobResult).exception() != null) {
-      return ErrorFacet.builder().exception(((JobFailed) jobResult).exception()).build();
+  protected ErrorFacet buildJobErrorFacet(String jobResult, Exception exception) {
+    if (jobResult.equals("FAIL") && exception != null) {
+      return ErrorFacet.builder().exception(exception).build();
     }
     return null;
   }
